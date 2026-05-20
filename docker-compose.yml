@@ -1,0 +1,198 @@
+version: "3.9"
+
+services:
+  # ─── Kafka (Redpanda - Kafka compatible, no ZooKeeper) ───────────────────────
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr 0.0.0.0:8082
+      - --advertise-pandaproxy-addr localhost:8082
+    ports:
+      - "9092:9092"
+      - "8082:8082"
+      - "9644:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy|true' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: redpanda-console
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_BROKERS=redpanda:29092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # ─── PostgreSQL (CQRS read model - orders projection) ───────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: cqrs_user
+      POSTGRES_PASSWORD: cqrs_pass
+      POSTGRES_DB: orders_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres_init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cqrs_user -d orders_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Redis (hot cache - latest order state) ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── MongoDB (append-only event store) ───────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: event_user
+      MONGO_INITDB_ROOT_PASSWORD: event_pass
+      MONGO_INITDB_DATABASE: event_store
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── LocalStack (S3 + SQS + EventBridge + Lambda) ───────────────────────────
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,sqs,events,lambda,iam,logs
+      - DEBUG=0
+      - LAMBDA_EXECUTOR=docker
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_DEFAULT_REGION=us-east-1
+      - PERSISTENCE=1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3 ls || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ─── FastAPI Application ─────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDPANDA_BROKERS=redpanda:29092
+      - POSTGRES_DSN=postgresql+asyncpg://cqrs_user:cqrs_pass@postgres:5432/orders_db
+      - REDIS_URL=redis://redis:6379
+      - MONGO_URI=mongodb://event_user:event_pass@mongo:27017/event_store?authSource=admin
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - S3_BUCKET=event-snapshots
+      - SQS_DLQ_URL=http://localstack:4566/000000000000/event-dlq
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─── Event Consumer (Kafka → Postgres + Redis + Mongo projections) ───────────
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: consumer
+    environment:
+      - REDPANDA_BROKERS=redpanda:29092
+      - POSTGRES_DSN=postgresql+asyncpg://cqrs_user:cqrs_pass@postgres:5432/orders_db
+      - REDIS_URL=redis://redis:6379
+      - MONGO_URI=mongodb://event_user:event_pass@mongo:27017/event_store?authSource=admin
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - S3_BUCKET=event-snapshots
+      - SQS_DLQ_URL=http://localstack:4566/000000000000/event-dlq
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: python -m consumers.main
+
+  # ─── Snapshot Archiver (Kafka → S3 every N events) ───────────────────────────
+  archiver:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: archiver
+    environment:
+      - REDPANDA_BROKERS=redpanda:29092
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - S3_BUCKET=event-snapshots
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: python -m consumers.archiver
+
+volumes:
+  pg_data:
+  mongo_data:
+  localstack_data:
