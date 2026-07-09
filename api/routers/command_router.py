@@ -36,6 +36,7 @@ from api.models.schemas import (
 from api.services.aggregate import OrderAggregate
 from api.services.event_store import EventStore
 from api.services.publisher import KafkaEventPublisher
+from api.services.payment_gateway import payment_gateway
 from dependencies import get_event_store, get_publisher, get_redis
 
 logger = structlog.get_logger()

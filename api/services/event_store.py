@@ -33,7 +33,7 @@ class EventStore:
     async def setup_indexes(self):
         """Called at startup. Idempotent."""
         await self._col.create_index(
-            [("aggregate_id", 1), ("aggregate_version", 1)],
+            [("aggregate_id", 1), ("aggregate_version", 1)], # 1 here means that ascending order
             unique=True,
             name="idx_aggregate_version",
         )

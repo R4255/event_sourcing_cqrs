@@ -181,6 +181,7 @@ async def consume():
         async for msg in consumer:
             event = json.loads(msg.value)
             order_id = event.get("aggregate_id", "unknown")
+            event_id = event.get("event_id")
 
             logger.info(
                 "processing_event",
@@ -191,10 +192,28 @@ async def consume():
                 offset=msg.offset,
             )
 
+            # Redis consumer-side deduplication
+            if event_id:
+                processed_key = f"processed:{event_id}"
+                already_processed = await redis.exists(processed_key)
+                if already_processed:
+                    logger.info(
+                        "skipping_already_processed_event",
+                        event_id=event_id,
+                        order_id=order_id,
+                        event_type=event.get("event_type")
+                    )
+                    await consumer.commit()
+                    continue
+
             try:
                 async with pg_pool.acquire() as conn:
                     await project_to_postgres(conn, event)
                 await invalidate_cache(redis, order_id)
+                
+                # Mark as processed in Redis
+                if event_id:
+                    await redis.setex(processed_key, 86400, "1")
 
                 # Commit offset AFTER successful projection
                 await consumer.commit()

@@ -34,7 +34,6 @@ async def lifespan(app: FastAPI):
         bootstrap_servers=settings.redpanda_brokers,
         acks="all",                    # wait for all ISR replicas
         enable_idempotence=True,       # exactly-once producer semantics
-        max_in_flight_requests_per_connection=5,
         compression_type="lz4",
     )
     await producer.start()

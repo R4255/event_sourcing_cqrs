@@ -84,7 +84,7 @@ async def get_order(
     result["updated_at"] = result["updated_at"].timestamp() if result["updated_at"] else None
 
     # 3. Cache it
-    await redis.setex(cache_key, settings.redis_cache_ttl, orjson.dumps(result))
+    await redis.setex(cache_key, settings.redis_cache_ttl, orjson.dumps(result, default=float))
 
     return result
 
