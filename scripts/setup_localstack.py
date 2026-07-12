@@ -120,6 +120,12 @@ def setup_lambda(role_arn: str, dlq_url: str):
     lmb = client("lambda")
     fn_name = "event-retry-handler"
     try:
+        lmb.delete_function(FunctionName=fn_name)
+        print(f"✓ Deleted existing Lambda function: {fn_name}")
+    except Exception:
+        pass
+
+    try:
         zip_bytes = package_lambda()
         resp = lmb.create_function(
             FunctionName=fn_name,
@@ -130,11 +136,12 @@ def setup_lambda(role_arn: str, dlq_url: str):
             Environment={
                 "Variables": {
                     "KAFKA_BROKERS": "redpanda:29092",
+                    "PANDAPROXY_URL": "http://redpanda:8082",
                     "KAFKA_TOPIC": "order-events",
                     "S3_BUCKET": "event-snapshots",
                     "SQS_DLQ_URL": dlq_url or "",
                     "AWS_ENDPOINT_URL": "http://localstack:4566",
-                    "AWS_DEFAULT_REGION": "us-east-1",
+                    "AWS_DEFAU LT_REGION": "us-east-1",
                     "AWS_ACCESS_KEY_ID": "test",
                     "AWS_SECRET_ACCESS_KEY": "test",
                 }
@@ -145,11 +152,6 @@ def setup_lambda(role_arn: str, dlq_url: str):
         print(f"✓ Lambda created: {fn_arn}")
         return fn_arn
     except Exception as e:
-        if "already exists" in str(e).lower() or "ResourceConflictException" in str(e):
-            resp = lmb.get_function(FunctionName=fn_name)
-            fn_arn = resp["Configuration"]["FunctionArn"]
-            print(f"✓ Lambda already exists: {fn_arn}")
-            return fn_arn
         print(f"✗ Lambda setup failed: {e}")
         return None
 

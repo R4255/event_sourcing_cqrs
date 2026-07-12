@@ -61,7 +61,7 @@ async def send_to_dlq(event: dict, error: str) -> None:
             MessageBody=json.dumps({
                 "event": event,
                 "error": error,
-                "retry_count": 0,
+                "retry_count": event.get("retry_count", 0),
             }),
             MessageAttributes={
                 "order_id": {"DataType": "String", "StringValue": event.get("aggregate_id", "unknown")},
@@ -173,6 +173,8 @@ async def consume():
         max_size=5,
     )
     redis = from_url(settings.redis_url, encoding="utf-8", decode_responses=False)
+    mongo_client = AsyncIOMotorClient(settings.mongo_uri)
+    event_store = EventStore(mongo_client)
 
     await consumer.start()
     logger.info("consumer_started", brokers=settings.redpanda_brokers, topic=settings.kafka_topic_orders)
@@ -182,6 +184,7 @@ async def consume():
             event = json.loads(msg.value)
             order_id = event.get("aggregate_id", "unknown")
             event_id = event.get("event_id")
+            etype = event.get("event_type")
 
             logger.info(
                 "processing_event",
@@ -215,6 +218,11 @@ async def consume():
                 if event_id:
                     await redis.setex(processed_key, 86400, "1")
 
+                # If terminal event state reached, mark MongoDB events for TTL pruning in 30 days
+                if etype in (EventType.ORDER_DELIVERED, EventType.ORDER_CANCELLED):
+                    await event_store.set_expiry_for_aggregate(order_id)
+                    logger.info("scheduled_event_expiry_ttl", order_id=order_id)
+
                 # Commit offset AFTER successful projection
                 await consumer.commit()
                 logger.info("event_projected", order_id=order_id, event_type=event.get("event_type"))
@@ -234,6 +242,7 @@ async def consume():
         await consumer.stop()
         await pg_pool.close()
         await redis.aclose()
+        mongo_client.close()
         logger.info("consumer_stopped")
 
 

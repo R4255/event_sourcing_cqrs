@@ -2,12 +2,12 @@
 Lambda Retry Handler — deployed to LocalStack.
 
 Flow:
-SQS DLQ → EventBridge Pipe (or scheduled rule) → this Lambda → Kafka
+SQS DLQ → EventBridge Scheduled Rule → this Lambda → Kafka (via Pandaproxy)
 
 When a projection consumer fails (e.g. Postgres down), the event goes to DLQ.
 This Lambda:
 1. Reads from SQS DLQ
-2. Re-publishes the failed event back to Kafka
+2. Re-publishes the failed event back to Kafka using the HTTP REST Proxy (Pandaproxy)
 3. Increments retry_count
 4. If retry_count >= 3, moves to "dead" S3 key (poison pill bucket)
 
@@ -25,21 +25,37 @@ or Kafka consumer group rebalancing.
 import json
 import os
 import time
+import urllib.request
+import urllib.error
 import boto3
-from kafka import KafkaProducer
 
-KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "localhost:9092")
+PANDAPROXY_URL = os.environ.get("PANDAPROXY_URL", "http://redpanda:8082")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "order-events")
 S3_BUCKET = os.environ.get("S3_BUCKET", "event-snapshots")
 MAX_RETRIES = 3
 
 
-def get_producer():
-    return KafkaProducer(
-        bootstrap_servers=KAFKA_BROKERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        key_serializer=lambda k: k.encode("utf-8") if k else None,
+def publish_to_kafka_via_proxy(topic: str, key: str, value: dict) -> None:
+    """Publish a record to Kafka using the Redpanda REST proxy (Pandaproxy)."""
+    url = f"{PANDAPROXY_URL}/topics/{topic}"
+    payload = {
+        "records": [
+            {
+                "key": key,
+                "value": value
+            }
+        ]
+    }
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={"Content-Type": "application/vnd.kafka.json.v2+json"},
+        method="POST",
     )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        if response.status not in (200, 201, 202):
+            raise RuntimeError(f"Unexpected status from REST proxy: {response.status}")
 
 
 def handler(event, context):
@@ -76,7 +92,6 @@ def handler(event, context):
         print("No messages in DLQ")
         return {"retried": 0}
 
-    producer = get_producer()
     retried = 0
     dead_lettered = 0
 
@@ -104,21 +119,23 @@ def handler(event, context):
             dead_lettered += 1
         else:
             # Re-publish to Kafka for retry
-            producer.send(
-                KAFKA_TOPIC,
-                key=order_id,
-                value=domain_event,
-            )
-            print(f"Retrying event {domain_event.get('event_id')} for order {order_id} (attempt {retry_count + 1})")
-            retried += 1
+            try:
+                domain_event["retry_count"] = retry_count + 1
+                publish_to_kafka_via_proxy(
+                    topic=KAFKA_TOPIC,
+                    key=order_id,
+                    value=domain_event
+                )
+                print(f"Retrying event {domain_event.get('event_id')} for order {order_id} (attempt {retry_count + 1})")
+                retried += 1
+            except Exception as e:
+                print(f"Failed to publish event {domain_event.get('event_id')} to REST proxy: {e}")
+                continue
 
         # Delete from DLQ
         sqs.delete_message(
             QueueUrl=dlq_url,
             ReceiptHandle=msg["ReceiptHandle"],
         )
-
-    producer.flush()
-    producer.close()
 
     return {"retried": retried, "dead_lettered": dead_lettered}

@@ -17,6 +17,7 @@ DDIA connection: This is the "log" abstraction. Like Kafka, like WAL.
 Append-only, ordered by version, replayable.
 """
 
+from datetime import datetime, timedelta
 import structlog
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
@@ -43,6 +44,11 @@ class EventStore:
         )
         await self._col.create_index("event_type", name="idx_event_type")
         await self._col.create_index("event_id", unique=True, name="idx_event_id")
+        await self._col.create_index(
+            "expires_at",
+            expireAfterSeconds=0,
+            name="idx_event_expiry",
+        )
         logger.info("event_store_indexes_ready")
 
     async def append(self, event: dict) -> None:
@@ -88,3 +94,11 @@ class EventStore:
             {"_id": 0},
         ).sort("occurred_at", -1).limit(limit)
         return await cursor.to_list(length=None)
+
+    async def set_expiry_for_aggregate(self, aggregate_id: str, retention_seconds: int = 2592000) -> None:
+        """Set expires_at on all events of an aggregate to enable TTL pruning."""
+        expiry_date = datetime.utcnow() + timedelta(seconds=retention_seconds)
+        await self._col.update_many(
+            {"aggregate_id": aggregate_id},
+            {"$set": {"expires_at": expiry_date}},
+        )
